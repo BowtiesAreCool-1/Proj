@@ -87,7 +87,7 @@ The single most important design decision: define one canonical `Paper` schema e
 ```python
 # storage/models.py
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import datetime
 
 @dataclass
 class Paper:
@@ -104,9 +104,28 @@ class Paper:
     source: str = "unknown"        # which API this record came from
     url: str | None = None
     embedding: list[float] | None = None   # populated later by the AI layer
+    cached_at: datetime | None = None       # when this record first entered our DB
+    citation_refreshed_at: datetime | None = None  # last time citation_count was updated
+    last_seen_at: datetime | None = None    # last time this paper was shown to a user
+    times_shown: int = 0                     # how many searches actually displayed this paper
 ```
 
 `doi` (falling back to `arxiv_id` when there is no DOI) is the join key used for de-duplication across sources — this is what lets results from three different APIs merge into one clean list instead of showing the same paper three times.
+
+**`papers.db` is persistent, not temporary.** Papers are cached indefinitely once fetched — nothing gets wiped after a search. The database only grows from what people actually search for (a lazy/demand-driven cache), which keeps it small in practice: even 100,000 cached papers is well under half a gigabyte. Section 4.5 below covers how freshness is handled without needing to re-fetch everything on every request.
+
+A second small table tracks searches themselves, separate from the papers they returned:
+
+```sql
+-- storage/schema.sql (excerpt)
+CREATE TABLE search_queries (
+    query_text TEXT PRIMARY KEY,
+    last_run_at TIMESTAMP,
+    result_count INTEGER
+);
+```
+
+This is what powers the freshness check — it lets the system answer "have we already searched this recently?" without having to inspect every paper in the database.
 
 ---
 
@@ -144,9 +163,9 @@ def dedupe(papers: list[Paper]) -> list[Paper]:
 ```python
 # ingestion/pipeline.py
 async def ingest_query(query: str) -> list[Paper]:
-    """Fan-out: calls search() on every configured client in parallel via asyncio.gather,
-    normalizes every result, de-duplicates the combined list, and writes new/updated
-    records to the database.
+    """Checks the local cache's freshness first (see 4.5); only fans out to
+    external clients in parallel via asyncio.gather when the query is new or
+    stale, then normalizes, de-duplicates, and writes results to the database.
     """
 ```
 
@@ -165,7 +184,68 @@ def get_all_papers(filters: dict | None = None) -> list[Paper]:
 
 def save_embedding(paper_id: str, vector: list[float]) -> None:
     """Store a computed embedding for later semantic search."""
+
+def was_recently_searched(query: str, max_age_days: int = 7) -> bool:
+    """Checks the search_queries table for this query's last_run_at.
+    Returns True if it was run within max_age_days -> safe to serve from cache
+    without hitting the external APIs again.
+    """
+
+def record_search(query: str, result_count: int) -> None:
+    """Logs that this query was just run, so future identical/similar searches
+    can skip re-fetching from external APIs.
+    """
+
+def get_papers_needing_citation_refresh(field: str = None, older_than_days: int = 90) -> list[Paper]:
+    """Returns papers whose citation_count hasn't been refreshed recently.
+    Citation counts are the one field that meaningfully changes after publication —
+    everything else (title, authors, abstract) is effectively permanent.
+    """
+
+def mark_papers_seen(paper_ids: list[str]) -> None:
+    """Called once after every search, with the IDs of papers actually shown to the
+    user (i.e. after ranking/filtering, not every paper that was merely fetched).
+    For each ID: sets last_seen_at = now() and increments times_shown by 1.
+    This is the signal used for pruning below — a paper that's never shown in any
+    search result is a paper nobody's queries actually needed.
+    """
+
+def prune_unused_papers(older_than_days: int = 180) -> int:
+    """Deletes papers where last_seen_at is older than the cutoff, OR last_seen_at
+    is still null and cached_at is older than the cutoff (papers that were fetched
+    and stored but never actually ranked into a result a user saw). Returns the
+    number of rows deleted. Run this occasionally (e.g. a manual script run monthly),
+    not on every request — this is cheap insurance against unbounded growth over a
+    year of development, not something that matters at this project's actual scale
+    (see Section 3).
+    """
 ```
+
+#### 4.5 Caching & freshness strategy
+
+The design decision: **cache what's searched, keep it indefinitely, treat it as valid unless proven otherwise.** No temporary storage, no wipe-and-refetch on every request. Concretely, `ingestion/pipeline.py` uses the freshness check like this:
+
+```python
+# ingestion/pipeline.py
+async def ingest_query(query: str) -> list[Paper]:
+    """1. Check was_recently_searched(query). If True, skip external calls entirely
+          and let the search layer work directly off the local cache.
+       2. If False (new or stale query), fan out to all configured clients in
+          parallel via asyncio.gather, normalize, de-duplicate, and upsert_paper()
+          each result into the DB.
+       3. Call record_search(query, result_count) so this query counts as fresh
+          for future requests.
+    """
+```
+
+Why this works, and why the earlier "fetch → temp store → wipe" idea was worth avoiding:
+
+- Titles, authors, and abstracts don't change after publication — there's nothing to "keep fresh" about them, so persisting them forever is safe, not risky.
+- Citation counts are the one field that does drift over time. Rather than refreshing everything, only that field gets periodically updated for papers people actually care about, via `get_papers_needing_citation_refresh()` — a small, optional background job, not something that runs on every search.
+- New papers still enter the system automatically: any query that isn't well-covered locally (or hasn't been run in a while) triggers a live fetch, same as before — nothing about "always serve fresh new content" is lost.
+- Embeddings computed for the AI layer stay valid across searches instead of being recomputed on every request, which is what keeps semantic search fast.
+
+**Tracking usage, and pruning what's never used.** After the search & ranking layer decides the final list of papers to actually display for a query, the interface layer calls `mark_papers_seen()` with those paper IDs (not the raw, unranked fetch results — only what a user actually saw). This is what makes `times_shown` meaningful as a "how popular is this paper in our own search history" signal, and what makes `prune_unused_papers()` safe to run: a paper only gets deleted if it's genuinely never surfaced in any result a user looked at, not just because it happened to get fetched once by a broad query.
 
 ### Search & ranking layer
 
@@ -264,10 +344,10 @@ def search_endpoint(q: str, year: int = None, field: str = None, mode: str = "ke
 
 1. User types a query into the interface (CLI or web).
 2. **If it's a natural-language query:** the AI layer's `parse_natural_language_query()` turns it into structured filters + keywords.
-3. The system checks the local database first (`storage.get_all_papers()` with filters applied). If the query hasn't been seen before, the ingestion pipeline (`ingestion.pipeline.ingest_query()`) fans out to all configured APIs in parallel, normalizes and de-duplicates the results, and writes them into storage — this is the point where new papers enter the system.
+3. The system checks the local database first (`storage.get_all_papers()` with filters applied) and whether this query was recently run (`storage.was_recently_searched()`). If it's a new or stale query, the ingestion pipeline (`ingestion.pipeline.ingest_query()`) fans out to all configured APIs in parallel, normalizes and de-duplicates the results, and `upsert`s them into storage — this is the point where new papers enter the system. If the query was searched recently, this step is skipped entirely and the search runs directly against the existing cache.
 4. The search layer runs keyword matching and BM25 ranking (`search.keyword_index`, `search.ranking`) on the (now larger) local dataset.
 5. In parallel, the AI layer's `semantic_search()` runs the same query against the vector index for meaning-based matches.
-6. The two result sets are merged (a paper found by both methods should rank higher than one found by only one).
+6. The two result sets are merged (a paper found by both methods should rank higher than one found by only one), and `storage.mark_papers_seen()` is called with the IDs of the final displayed list — this is what keeps `last_seen_at`/`times_shown` accurate for future pruning.
 7. The interface displays results. If the user clicks into one paper, `summarizer.summarize_abstract()` can be called on demand for a quick digest, and (stretch) `qa_chat.answer_question()` lets them ask a specific question about it.
 
 This lifecycle is also exactly what should guide your test suite: each numbered step above corresponds to one function that can be unit-tested independently of the others, since every layer only depends on the shape of the `Paper` object, not on how another layer is implemented internally.
