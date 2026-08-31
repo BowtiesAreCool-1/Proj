@@ -6,56 +6,91 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import time
 import uuid
 import requests
 import xml.etree.ElementTree as ET
 from storage.models import Paper
 
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
+
+# arXiv's usage guidelines ask API users to keep requests to roughly one
+# every 3 seconds, so this client self-throttles the same way the Semantic
+# Scholar client does.
+_MIN_INTERVAL_SECONDS = 3.0
+_last_call_at = 0.0
+
+
+def _throttle() -> None:
+    global _last_call_at
+    elapsed = time.monotonic() - _last_call_at
+    if elapsed < _MIN_INTERVAL_SECONDS:
+        time.sleep(_MIN_INTERVAL_SECONDS - elapsed)
+    _last_call_at = time.monotonic()
+
+
+def _text(entry, tag: str, namespace: dict) -> str | None:
+    node = entry.find(tag, namespace)
+    return node.text if node is not None and node.text is not None else None
+
 
 def search_arxiv(query: str, limit: int = 5) -> list[Paper]:
     """Queries the arXiv API and returns a list of Paper objects."""
     params = {
         "search_query": f"all:{query}",
         "start": 0,
-        "max_results": limit
+        "max_results": limit,
     }
-    
+
+    _throttle()
     try:
         response = requests.get(ARXIV_API_URL, params=params, timeout=15)
         response.raise_for_status()
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         print(f"[arXiv Error]: {e}")
         return []
 
-    # Parse the XML response
-    root = ET.fromstring(response.content)
-    namespace = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
-    
+    try:
+        root = ET.fromstring(response.content)
+    except ET.ParseError as e:
+        print(f"[arXiv Error] Could not parse response XML: {e}")
+        return []
+
+    namespace = {
+        "atom": "http://www.w3.org/2005/Atom",
+        "arxiv": "http://arxiv.org/schemas/atom",
+    }
     papers = []
+
     for entry in root.findall("atom:entry", namespace):
-        # Extract arXiv ID from the entry ID url (e.g., http://arxiv.org/abs/2101.12345v1)
-        raw_id = entry.find("atom:id", namespace).text if entry.find("atom:id", namespace) is not None else ""
+        raw_id = _text(entry, "atom:id", namespace) or ""
         arxiv_id = raw_id.split("/abs/")[-1] if "/abs/" in raw_id else None
 
-        title = entry.find("atom:title", namespace).text.strip().replace("\n", " ") if entry.find("atom:title", namespace) is not None else "Untitled"
-        abstract = entry.find("atom:summary", namespace).text.strip().replace("\n", " ") if entry.find("atom:summary", namespace) is not None else None
-        
-        # Published year
-        published = entry.find("atom:published", namespace).text if entry.find("atom:published", namespace) is not None else ""
+        title_raw = _text(entry, "atom:title", namespace)
+        title = title_raw.strip().replace("\n", " ") if title_raw else "Untitled"
+
+        abstract_raw = _text(entry, "atom:summary", namespace)
+        abstract = abstract_raw.strip().replace("\n", " ") if abstract_raw else None
+
+        published = _text(entry, "atom:published", namespace) or ""
         year = int(published[:4]) if len(published) >= 4 and published[:4].isdigit() else None
 
-        # Authors list
         author_elements = entry.findall("atom:author", namespace)
-        authors = [a.find("atom:name", namespace).text for a in author_elements if a.find("atom:name", namespace) is not None]
+        authors = []
+        for a in author_elements:
+            name_node = a.find("atom:name", namespace)
+            if name_node is not None and name_node.text:
+                authors.append(name_node.text)
 
-        # Extract DOI if present
         doi_elem = entry.find("arxiv:doi", namespace)
         doi = doi_elem.text if doi_elem is not None else None
 
-        # Primary category/field of study
         category_elem = entry.find("arxiv:primary_category", namespace)
-        field_of_study = [category_elem.attrib.get("term")] if category_elem is not None and "term" in category_elem.attrib else []
+        field_of_study = (
+            [category_elem.attrib["term"]]
+            if category_elem is not None and "term" in category_elem.attrib
+            else []
+        )
 
         paper = Paper(
             id=str(uuid.uuid4()),
@@ -68,7 +103,7 @@ def search_arxiv(query: str, limit: int = 5) -> list[Paper]:
             venue="arXiv",
             field_of_study=field_of_study,
             source="arxiv",
-            url=raw_id
+            url=raw_id or None,
         )
         papers.append(paper)
 
